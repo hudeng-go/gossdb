@@ -7,7 +7,9 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"log"
 	"net"
+	"os"
 	"runtime"
 	"strconv"
 	"time"
@@ -85,7 +87,8 @@ type SSDBClient struct {
 	//将输入参数成[]byte，默认会转换成json格式,可以修改这个参数以便使用自定义的序列化方式
 	EncodingFunc func(v interface{}) []byte
 	//dialer
-	dialer *net.Dialer
+	dialer   *net.Dialer
+	recv_buf bytes.Buffer
 }
 
 //Start start socket
@@ -110,7 +113,7 @@ func (s *SSDBClient) Start() error {
 	if err != nil {
 		return err
 	}
-	s.bufSize = (s.readBufferSize + s.writeBufferSize) * 1024
+	s.bufSize = s.writeBufferSize * 1024
 	s.buf = make([]byte, s.bufSize)
 	s.sock = sock
 	s.timeZero = time.Time{}
@@ -161,6 +164,7 @@ func (s *SSDBClient) do(args ...interface{}) (resp []string, err error) {
 	}
 	return
 }
+
 func (s *SSDBClient) auth() error {
 	if s.password == "" { //without a password, authentication is not required
 		return nil
@@ -357,100 +361,84 @@ func (s *SSDBClient) send(args []interface{}) (err error) {
 	return nil
 }
 
-//接收数据
+// func recv...
 func (s *SSDBClient) recv() (resp []string, err error) {
-	//设置读取数据超时，
 	if err = s.sock.SetReadDeadline(time.Now().Add(time.Second * time.Duration(s.readTimeout))); err != nil {
 		return nil, err
 	}
-	resp, err = s.parse()
-	if err != nil {
-		return nil, err
-	}
-	//设置不超时
-	if err = s.sock.SetReadDeadline(s.timeZero); err != nil {
-		return nil, err
-	}
-	return resp, nil
-}
 
-//parse 解析数据为string的slice
-func (s *SSDBClient) parse() (resp []string, err error) {
-	var blockSize, bufSize, status, offset int
-	var rs []string
-	//如何一次读取就可以解析完成，就不需要使用bytes.Buffer
-	bufSize, err = s.sock.Read(s.buf)
-	if err != nil {
-		return nil, err
-	}
-	if bufSize > 0 {
-		rs, status, blockSize, offset = s.parseBuffer(s.buf[:bufSize])
-		if status == 1 { //解析完成
-			resp = append(resp, rs...)
-			return
-		} else if offset > 0 {
-			resp = append(resp, rs...)
-		}
-	}
-	//大数据量读取
-	var bs bytes.Buffer
-	bs.Write(s.buf[offset:bufSize])
+	tmp := make([]byte, s.readBufferSize)
+	s.recv_buf.Reset()
 	for {
-		bufSize, err = s.sock.Read(s.buf)
+		resp, err := s.parse()
+		if resp == nil || len(resp) > 0 {
+			s.sock.SetReadDeadline(s.timeZero)
+			return resp, err
+		}
+		n, err := s.sock.Read(tmp[0:])
 		if err != nil {
+			s.sock.SetReadDeadline(s.timeZero)
 			return nil, err
 		}
-		if bufSize == 0 {
-			runtime.Gosched()
-			continue //no data
-		}
-		bs.Write(s.buf[:bufSize])
-		if bs.Len() < blockSize { //数据不足，补充数据
-			continue
-		}
-		rs, status, blockSize, offset = s.parseBuffer(bs.Bytes())
-		if status == 0 { //数据不足，补充数据
-			continue
-		} else if status == 1 { //解析完成
-			if offset > 0 {
-				resp = append(resp, rs...)
-			}
-			break
-		} else {
-			resp = append(resp, rs...)
-			bs.Next(offset)
-		}
+		s.recv_buf.Write(tmp[0:n])
 	}
-	bs.Reset()
-	return
 }
 
-//parseBuffer 数据包分解，发现长度，找到结尾，循环发现，发现空行，结束
-func (s *SSDBClient) parseBuffer(buf []byte) (resp []string, status int, blockSize int, offset int) {
-	delim := 1
-	bufSize := len(buf)
-	var n int
-	for {
-		n = bytes.IndexByte(buf[offset:], endN)
-		if n == -1 { //没有数据
-			return
-		}
-		if n == 0 || n == 1 && buf[offset] == endR { //空行，说明一个数据包结束
-			status = 1 //结束
-			return
-		}
-		//数据包开始，包长度解析
-		blockSize = toNum(buf[offset : offset+n])
-		if buf[offset+n] == endR {
-			delim = 2
-		}
-		n++ //add \n
-		if offset+n+blockSize+delim >= bufSize {
-			status = -1
-			blockSize = n + blockSize + delim
-			return
-		}
-		resp = append(resp, string(buf[offset+n:offset+n+blockSize]))
-		offset = offset + n + blockSize + delim
+func logs(v ...interface{}) {
+	/* if os.Getenv("GOSSDB_LOG") == "" {
+		return
+	} */
+
+	file, err := os.OpenFile("/tmp/gossdb.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Printf("Warn: gossdb log failed: %v", err)
 	}
+	defer file.Close()
+
+	log.SetOutput(file)
+	log.Println(v...)
+}
+
+//func parse...
+func (s *SSDBClient) parse() ([]string, error) {
+	resp := []string{}
+	buf := s.recv_buf.Bytes()
+	var idx, offset int
+	idx = 0
+	offset = 0
+
+	for {
+		idx = bytes.IndexByte(buf[offset:], endN)
+		if idx == -1 {
+			break
+		}
+		p := buf[offset : offset+idx]
+		offset += idx + 1
+		if len(p) == 0 || (len(p) == 1 && p[0] == endR) {
+			if len(resp) == 0 {
+				continue
+			} else {
+				var new_buf bytes.Buffer
+				new_buf.Write(buf[offset:])
+				s.recv_buf = new_buf
+				return resp, nil
+			}
+		}
+
+		size, err := strconv.Atoi(string(p))
+		if err != nil || size < 0 {
+			logs(string(p), " atoi got error: ", err, "resp: ", resp)
+			return nil, err
+		}
+		if offset+size >= s.recv_buf.Len() {
+			break
+		}
+
+		v := buf[offset : offset+size]
+		resp = append(resp, string(v))
+		offset += size + 1
+	}
+
+	//fmt.Printf("buf.size: %d packet not ready...\n", len(buf))
+	return []string{}, nil
 }
