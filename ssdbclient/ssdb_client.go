@@ -10,8 +10,8 @@ import (
 	"log"
 	"net"
 	"os"
-	"runtime"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/seefan/goerr"
@@ -68,8 +68,6 @@ type SSDBClient struct {
 	connectTimeout int
 	//ssdb port
 	port int
-	//bufSize
-	bufSize int
 	//tmpSize
 	offset int
 	//0时间
@@ -80,8 +78,6 @@ type SSDBClient struct {
 	host string
 	//connection
 	sock *net.TCPConn
-	//readBuf
-	buf []byte
 	//The input parameter is converted to [] bytes, which by default is converted to json format
 	//and can be modified to use a custom serialization
 	//将输入参数成[]byte，默认会转换成json格式,可以修改这个参数以便使用自定义的序列化方式
@@ -89,6 +85,8 @@ type SSDBClient struct {
 	//dialer
 	dialer   *net.Dialer
 	recv_buf bytes.Buffer
+	send_buf bytes.Buffer
+	sync.Mutex
 }
 
 //Start start socket
@@ -113,8 +111,6 @@ func (s *SSDBClient) Start() error {
 	if err != nil {
 		return err
 	}
-	s.bufSize = s.writeBufferSize * 1024
-	s.buf = make([]byte, s.bufSize)
 	s.sock = sock
 	s.timeZero = time.Time{}
 	s.isOpen = true
@@ -126,7 +122,6 @@ func (s *SSDBClient) Start() error {
 //  @return error that may occur on shutdown. Return nil if successful shutdown
 func (s *SSDBClient) Close() error {
 	s.isOpen = false
-	s.buf = nil
 	if s.sock == nil {
 		return nil
 	}
@@ -145,23 +140,28 @@ func (s *SSDBClient) IsOpen() bool {
 
 //执行ssdb命令
 func (s *SSDBClient) do(args ...interface{}) (resp []string, err error) {
+	//fmt.Println("do", args)
 	if !s.isOpen {
 		return nil, goerr.String("gossdb client is closed.")
 	}
+	s.Lock()
 	defer func() {
 		if e := recover(); e != nil {
 			s.isOpen = false
 			err = fmt.Errorf("%v", e)
 		}
+		s.Unlock()
 	}()
 	if err = s.send(args); err != nil {
 		s.isOpen = false
 		return nil, goerr.Errorf(err, "client send error")
 	}
+	//fmt.Println("do after send", args)
 	if resp, err = s.recv(); err != nil {
 		s.isOpen = false
 		return nil, goerr.Errorf(err, "client recv error")
 	}
+	//fmt.Println("do after recv", args)
 	return
 }
 
@@ -221,50 +221,24 @@ func (s *SSDBClient) Do(args ...interface{}) ([]string, error) {
 //write write to buf
 func (s *SSDBClient) writeBytes(bs []byte) error {
 	lbs := strconv.AppendInt(nil, int64(len(bs)), 10)
-	if err := s.write(lbs, len(lbs)); err != nil {
+	if err := s.write(lbs); err != nil {
 		return err
 	}
-	if err := s.write([]byte{endN}, 1); err != nil {
+	if err := s.write([]byte{endN}); err != nil {
 		return err
 	}
-	if err := s.write(bs, len(bs)); err != nil {
+	if err := s.write(bs); err != nil {
 		return err
 	}
-	if err := s.write([]byte{endN}, 1); err != nil {
-		return err
-	}
-	return nil
-}
-func (s *SSDBClient) write(bs []byte, size int) error {
-	if s.offset+size < s.bufSize {
-		copy(s.buf[s.offset:], bs)
-		s.offset += size
-		return nil
-	}
-	err := s.writeSocket(s.buf[:s.offset], s.offset)
-	if err != nil {
-		return err
-	}
-	s.offset = 0
-	err = s.writeSocket(bs, size)
-	if err != nil {
+	if err := s.write([]byte{endN}); err != nil {
 		return err
 	}
 	return nil
 }
-func (s *SSDBClient) writeSocket(bs []byte, size int) error {
-	wn := 0
-	for {
-		n, err := s.sock.Write(bs)
-		if err != nil {
-			return err
-		}
-		if n == size || wn+n == size {
-			return nil
-		}
-		wn += n
-		runtime.Gosched()
-	}
+
+func (s *SSDBClient) write(bs []byte) error {
+	s.send_buf.Write(bs)
+	return nil
 }
 
 //send cmd to ssdb
@@ -273,6 +247,7 @@ func (s *SSDBClient) send(args []interface{}) (err error) {
 		return err
 	}
 	s.offset = 0
+	s.send_buf.Reset()
 	for _, arg := range args {
 		switch arg := arg.(type) {
 		case string:
@@ -335,20 +310,11 @@ func (s *SSDBClient) send(args []interface{}) (err error) {
 			return err
 		}
 	}
-	if s.offset < s.bufSize {
-		s.buf[s.offset] = endN
-		s.offset++
-		if s.offset < s.bufSize {
-			err = s.writeSocket(s.buf[:s.offset], s.offset)
-		} else {
-			err = s.writeSocket(s.buf[:], s.bufSize)
-		}
-	} else {
-		if err = s.writeSocket(s.buf[:s.offset], s.offset); err == nil {
-			err = s.writeSocket([]byte{endN}, 1)
-		}
-	}
 
+	//fmt.Println("do sending", s.send_buf.String())
+	s.send_buf.WriteByte(endN)
+	_, err = s.sock.Write(s.send_buf.Bytes())
+	//fmt.Println(n, err, len(s.send_buf.Bytes()))
 	if err != nil {
 		return err
 	}
